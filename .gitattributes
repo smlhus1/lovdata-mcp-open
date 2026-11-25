@@ -1,0 +1,2 @@
+# Fixtures are compared byte for byte (SHA-256), so line endings must be the same on every machine.
+* text=auto eol=lf
