@@ -1,5 +1,5 @@
 // Turns lookups and searches into the text the MCP tools answer with.
-import { Store, ensureFresh, dataDir, paragraphKey, refidFromId, MAX_CANDIDATES, INTRODUCTION } from "./store.mjs";
+import { Store, ensureFresh, localIndexNow, dataDir, paragraphKey, refidFromId, MAX_CANDIDATES, INTRODUCTION, LOCAL } from "./store.mjs";
 import { historyOf, historyOfDocument, historySince } from "./history.mjs";
 
 const LICENSE =
@@ -120,9 +120,13 @@ async function withStore(dir, fn) {
 }
 
 /** Verbatim paragraph, or the document's table of contents when `paragraf` is left out. */
-export function hentParagraf({ dokument, paragraf }, dir = dataDir()) {
-  return withStore(dir, (store, fresh) => {
+export async function hentParagraf({ dokument, paragraf }, dir = dataDir()) {
+  let stale; // that current law could not be updated matters to "not found" too
+  const answer = await withStore(dir, (store, fresh) => {
     const { doc, candidates } = store.resolveDocument(dokument);
+    // Not among current laws and central regulations: it may be a local regulation.
+    stale = fresh.warning;
+    if (!doc && !candidates.length) return null;
     if (!doc) return unknownDocument(store, fresh, dokument, candidates);
     const out = [...documentLines(doc), ...basisLines(store, doc)];
 
@@ -157,10 +161,177 @@ export function hentParagraf({ dokument, paragraf }, dir = dataDir()) {
     out.push("", changeLine(doc), footer(store, [doc], fresh));
     return out.join("\n");
   });
+  return answer ?? hentLokal({ dokument, paragraf }, dir, stale);
 }
 
-/** Full-text search across laws and central regulations. */
-export function sok({ tekst, type, antall }, dir = dataDir()) {
+const NOT_CURRENT = (dokument) => `Fant ingen gjeldende lov eller sentral forskrift som heter «${dokument}».`;
+const NOT_CONSOLIDATED =
+  "Senere endringer er ikke innarbeidet i teksten, og forskriften kan være opphevet. Sjekk gjeldende tekst på lovdata.no før du bygger på den.";
+const CHANGES_REGISTERED = "Lovdatas registrering fra 2001 og framover, ikke nødvendigvis fullstendig";
+
+/** "2026-05-04 15:25" -> "2026-05-04" */
+const day = (published) => published?.slice(0, 10) ?? "ukjent dato";
+
+/**
+ * Answers from the index of local regulations that is in place. Never waits for Lovdata: a
+ * rebuild takes minutes and runs in the background. `missing` answers when there is no index yet.
+ */
+function withLocalStore(dir, fn, missing) {
+  const fresh = localIndexNow(dir);
+  if (!fresh.usable) return missing(LOCAL_MISSING + (fresh.warning ? ` Siste forsøk feilet: ${fresh.warning}` : ""));
+  const store = new Store(dir, LOCAL);
+  try {
+    return fn(store, fresh);
+  } finally {
+    store.close();
+  }
+}
+
+const LOCAL_MISSING =
+  "Lokale forskrifter er ikke indeksert på denne maskinen ennå. De hentes fra Lovdata i bakgrunnen, og det tar noen minutter. Prøv igjen da.";
+
+/** What stands above the text of a local regulation: that it is the announced text, and what Lovdata says has happened to it since. */
+function announcedLines(store, doc) {
+  const a = store.announcement(doc.refid);
+  const out = [
+    doc.title,
+    `Lokal forskrift · ID: ${doc.legacy_id ?? doc.refid} (${doc.refid})` + (doc.short_title ? ` · Korttittel: ${doc.short_title}` : ""),
+    "",
+    `KUNNGJORT TEKST, IKKE AJOURFØRT. Dette er forskriften slik den ble kunngjort i Norsk Lovtidend ${day(a.published)}. ${NOT_CONSOLIDATED}`,
+  ];
+  const changedBy = store.changedBy(doc.refid);
+  if (changedBy.length) {
+    out.push(`Senere kunngjøringer som endrer eller opphever denne forskriften (${CHANGES_REGISTERED}):`);
+    for (const c of changedBy) out.push(`- ${c.legacy_id ?? c.refid}, kunngjort ${day(c.published)}: ${c.title}`);
+  } else {
+    out.push(
+      `Ingen senere kunngjøring er registrert som endring eller oppheving av denne forskriften (${CHANGES_REGISTERED}). Det viser ikke at den gjelder uendret.`,
+    );
+  }
+  out.push("");
+  if (a.applies_to) out.push(`Gjelder for (Lovdatas opplysning): ${a.applies_to.replace(/\n/g, " ")}`);
+  if (a.in_force) out.push(`I kraft fra (Lovdatas opplysning): ${a.in_force.replace(/\n/g, " ")}`);
+  // The acts it rests on are in the other index, so they are named by ID. Lovdata's own sentence follows below.
+  const basis = store.basisOf(doc.refid).map((b) => (b.target_refid + " " + b.target_name.replace(/^§/, "§ ")).trim());
+  if (basis.length) out.push(`Hjemmel (${REGISTERED}): ${basis.join("; ")}`);
+  const changes = store.changesMadeBy(doc.refid);
+  if (changes.length) {
+    const targets = changes.map((c) => (c.title ? `${c.title} (${c.legacy_id ?? c.target_refid})` : `${c.target_refid} (ikke i datagrunnlaget)`));
+    out.push(`Endrer eller opphever (${REGISTERED}): ${targets.join("; ")}`);
+  }
+  if (a.misc) out.push(`Annet om dokumentet (Lovdatas opplysning): ${a.misc.replace(/\s+/g, " ").trim()}`);
+  return out;
+}
+
+function announcedPartLines(p) {
+  const out = ["", p.heading];
+  if (!p.text) out.push("(Delen har ingen tekst i kunngjøringen.)");
+  else if (p.text.length > MAX_TEXT) {
+    out.push(p.text.slice(0, MAX_TEXT), `[FORKORTET: viser ${MAX_TEXT} av ${p.text.length} tegn. Resten står på ${p.url}]`);
+  } else out.push(p.text);
+  if (p.notes) out.push("", "Lovdatas noter og fotnoter (ikke en del av forskriftsteksten):", p.notes);
+  return out;
+}
+
+/**
+ * A local regulation as announced in Norsk Lovtidend, or the plain answer that the document is unknown.
+ * @param {string} [stale] the warning that current law could not be updated, when there is one
+ */
+function hentLokal({ dokument, paragraf }, dir, stale) {
+  // "Not found" is also a statement about current law, so its warning goes with every answer from here.
+  const current = stale ? ["ADVARSEL om gjeldende lover og sentrale forskrifter: " + stale] : [];
+  return withLocalStore(
+    dir,
+    (store, fresh) => {
+      const { doc, candidates } = store.resolveAnnounced(dokument);
+      if (!doc && !candidates.length) {
+        return [`${NOT_CURRENT(dokument)} Ingen kunngjort lokal forskrift heter det heller. Prøv verktøyet sok.`, "", ...current, footer(store, [], fresh)].join("\n");
+      }
+      if (!doc) {
+        const lines = candidates.map((d) => `- ${d.legacy_id ?? d.refid}: ${d.title}`);
+        if (candidates.length === MAX_CANDIDATES) lines.push(`(Viser de ${MAX_CANDIDATES} nyeste. Det kan finnes flere; vær mer presis eller bruk sok med type «lokal».)`);
+        return [
+          `${NOT_CURRENT(dokument)} Navnet passer på flere lokale forskrifter slik de ble kunngjort (nyeste først). Bruk ID-en til den du mener:`,
+          ...lines,
+          "",
+          ...current,
+          footer(store, candidates, fresh),
+        ].join("\n");
+      }
+      const parts = store.allParts(doc.refid);
+      const out = announcedLines(store, doc);
+      if (parts.length) out.push(parts[0].url); // every part of an announcement carries the document's address
+      if (!paragraf) {
+        const hasParagraphs = parts.some((p) => p.kind === "paragraf");
+        const size = parts.reduce((sum, p) => sum + p.text.length, 0);
+        if (!parts.length) out.push("", "(Dokumentet har ingen tekst i pakken.)");
+        else if (!hasParagraphs && size <= MAX_WHOLE_DOCUMENT) {
+          out.push("", "Dokumentet har ingen paragrafer. Hele teksten:");
+          for (const p of parts) out.push(...announcedPartLines(p));
+        } else {
+          out.push("", "Innhold. Hent en del ordrett ved å oppgi den som paragraf:");
+          for (const p of parts) out.push(p.heading.replace(/\n/g, " ") + handle(p));
+        }
+      } else {
+        const hits = store.parts(doc.refid, paragraf);
+        if (!hits.length) {
+          return [
+            `Fant ikke «${paragraf}» i ${doc.title} (${doc.refid}), slik den ble kunngjort. Kall verktøyet uten paragraf for å se hva dokumentet inneholder.`,
+            "",
+            ...current,
+            footer(store, [doc], fresh),
+          ].join("\n");
+        }
+        if (hits.length > 1) out.push(`Dokumentet har ${hits.length} deler med dette navnet. Alle vises.`);
+        for (const p of hits) out.push(...announcedPartLines(p));
+      }
+      out.push("", ...current, footer(store, [doc], fresh));
+      return out.join("\n");
+    },
+    // The answer about current law stands on its own when there are no local regulations to look in.
+    (missing) => [`${NOT_CURRENT(dokument)} Prøv verktøyet sok. ${missing}`, "", ...current, LICENSE].join("\n"),
+  );
+}
+
+/** Full-text search in local regulations as announced. */
+function sokLokal({ tekst, sted, antall }, dir) {
+  return withLocalStore(dir, (store, fresh) => {
+    const hits = store.searchAnnounced(tekst, { place: sted, limit: antall });
+    // The filter is on words in Lovdata's "applies to", so each hit shows that field itself.
+    const scope = sted ? `, avgrenset til stedet «${sted}»` : "";
+    if (!hits.length) {
+      const all = store.db.prepare("SELECT DISTINCT package FROM docs").all();
+      return [`Ingen treff på «${tekst}» i kunngjorte lokale forskrifter${scope}.`, "", footer(store, all, fresh)].join("\n");
+    }
+    const out = [
+      `${hits.length} treff på «${tekst}» i lokale forskrifter${scope} (beste først). Utdragene er forkortet.`,
+      `KUNNGJORT TEKST, IKKE AJOURFØRT. Hvert treff er en forskrift eller endringsforskrift slik den ble kunngjort i Norsk Lovtidend. ${NOT_CONSOLIDATED}`,
+    ];
+    for (const h of hits) {
+      out.push(
+        "",
+        `${h.title} (${h.legacy_id ?? h.refid}) · ${h.heading.replace(/\n/g, " ")}${handle(h)}`,
+        `Kunngjort ${day(h.published)}` +
+          (h.applies_to ? ` · Gjelder for: ${h.applies_to.replace(/\n/g, " ")}` : "") +
+          (h.changed ? ` · Endret eller opphevet av ${h.changed} senere kunngjøring${h.changed > 1 ? "er" : ""}` : ""),
+        h.url,
+        `Utdrag: ${h.snippet.replace(/\s+/g, " ").trim()}`,
+      );
+    }
+    out.push("", "Hent en forskrift med hent_paragraf og ID-en for å se teksten og hvilke senere kunngjøringer som endrer den.", "", footer(store, hits, fresh));
+    return out.join("\n");
+  }, (missing) => [missing, "", LICENSE].join("\n"));
+}
+
+/** Full-text search across laws and central regulations, or in local regulations when asked for. */
+export async function sok({ tekst, type, antall, sted }, dir = dataDir()) {
+  // A place only makes sense for local regulations, so naming one asks for them.
+  if (type === LOCAL || (sted && !type)) return sokLokal({ tekst, sted, antall }, dir);
+  const answer = await sokGjeldende({ tekst, type, antall }, dir);
+  return sted ? `«sted» gjelder bare lokale forskrifter og er ikke brukt i dette søket.\n\n${answer}` : answer;
+}
+
+function sokGjeldende({ tekst, type, antall }, dir) {
   return withStore(dir, (store, fresh) => {
     const hits = store.search(tekst, { type, limit: antall });
     if (!hits.length) {

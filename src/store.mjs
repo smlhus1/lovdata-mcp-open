@@ -1,8 +1,11 @@
 // Local copy of Lovdata's open data: download, index (SQLite + FTS5), lookup and search.
+// Two indexes side by side: current law (laws and central regulations, consolidated by
+// Lovdata) and local regulations as announced in Norsk Lovtidend (not consolidated).
 import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
+import { Worker } from "node:worker_threads";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +15,9 @@ import { notifyPinChanges } from "./pins.mjs";
 
 const run = promisify(execFile);
 
-const API = "https://api.lovdata.no/v1/publicData";
+// LOVDATA_MCP_API points the server at another host serving the same API. The tests use it to
+// make sure nothing in them can reach Lovdata.
+const defaultApi = () => process.env.LOVDATA_MCP_API || "https://api.lovdata.no/v1/publicData";
 export const PACKAGES = {
   "gjeldende-lover.tar.bz2": "lov",
   "gjeldende-sentrale-forskrifter.tar.bz2": "forskrift",
@@ -20,13 +25,25 @@ export const PACKAGES = {
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Lovdata publishes once a night
 const RETRY_AFTER_FAILURE_MS = 15 * 60 * 1000;
 const ABANDONED_BUILD_MS = 60 * 60 * 1000;
+// Building the local regulations takes a couple of minutes. A lock older than this was left by a killed process.
+const LOCAL_LOCK_STALE_MS = 15 * 60 * 1000;
 const SCHEMA_VERSION = "5";
+const LOCAL_SCHEMA_VERSION = "2";
+// Norsk Lovtidend avd. II. The names carry the years ("…-2001-2025", "…-2026") and change
+// at New Year, so the packages are found by pattern, not by name.
+const LOCAL_PACKAGE = /^lovtidend-avd2-[\d-]+\.tar\.bz2$/;
+export const LOCAL = "lokal";
+
+const SOURCES = {
+  gjeldende: { db: "lovdata.db", checked: "checked.json", schema: SCHEMA_VERSION },
+  [LOCAL]: { db: "lokal.db", checked: "checked-lokal.json", schema: LOCAL_SCHEMA_VERSION },
+};
 const USER_AGENT = "lovdata-mcp/0.1";
 
 export const dataDir = () =>
   process.env.LOVDATA_MCP_DATA || path.join(os.homedir(), ".lovdata-mcp");
-const dbPath = (dir) => path.join(dir, "lovdata.db");
-const checkedFile = (dir) => path.join(dir, "checked.json");
+const dbPath = (dir, source = SOURCES.gjeldende) => path.join(dir, source.db);
+const checkedFile = (dir, source) => path.join(dir, source.checked);
 
 async function fetchOk(url, timeoutMs) {
   const res = await fetch(url, {
@@ -37,11 +54,14 @@ async function fetchOk(url, timeoutMs) {
   return res;
 }
 
-/** Package dates as published by Lovdata: { filename: lastModified }. */
-async function fetchPackageDates(api) {
+/** Dates of the source's packages as published by Lovdata: { filename: lastModified }. */
+async function fetchPackageDates(api, source) {
   const list = await (await fetchOk(`${api}/list`, 15_000)).json();
+  const names =
+    source === SOURCES[LOCAL] ? list.map((e) => e.filename).filter((name) => LOCAL_PACKAGE.test(name)).sort() : Object.keys(PACKAGES);
+  if (!names.length) throw new Error("Lovdata's list no longer contains local regulations (lovtidend-avd2)");
   const dates = {};
-  for (const name of Object.keys(PACKAGES)) {
+  for (const name of names) {
     const entry = list.find((e) => e.filename === name);
     if (!entry?.lastModified) throw new Error(`Lovdata's list no longer contains ${name}`);
     dates[name] = entry.lastModified;
@@ -86,6 +106,19 @@ const SCHEMA = `
     heading, text, content='parts', content_rowid='id',
     tokenize="unicode61 remove_diacritics 0"
   );
+`;
+
+// Only in the index of local regulations: Lovdata's own fields on each announcement, and
+// which earlier documents it says the announcement changes (amendment or repeal alike).
+// place is Lovdata's "applies to" as whole words in lower case, for filtering on municipality;
+// the title stands in for it on the few announcements where the field is empty.
+const LOCAL_SCHEMA = `
+  CREATE TABLE local_docs (
+    refid TEXT PRIMARY KEY, published TEXT, in_force TEXT, applies_to TEXT, misc TEXT, place TEXT NOT NULL
+  );
+  CREATE TABLE changes (refid TEXT NOT NULL, target_refid TEXT NOT NULL);
+  CREATE INDEX changes_target ON changes (target_refid);
+  CREATE INDEX changes_source ON changes (refid);
 `;
 
 /**
@@ -133,12 +166,14 @@ function documentNames(meta) {
  * Builds a fresh database from extracted packages. One unreadable document fails the
  * whole build: an index that silently lacks a law is worse than yesterday's index.
  * @param {string} file database file to create (must not exist)
- * @param {{ dir: string, package: string, date: string }[]} sources extracted package directories
+ * @param {{ dir: string, package: string, date: string, type?: string }[]} sources extracted package
+ *   directories; type "lokal" on them builds the index of local regulations
  */
 export function buildDatabase(file, sources) {
+  const local = sources.some((source) => source.type === LOCAL);
   const db = new DatabaseSync(file);
   try {
-    db.exec(SCHEMA);
+    db.exec(SCHEMA + (local ? LOCAL_SCHEMA : ""));
     const meta = db.prepare("INSERT INTO meta VALUES (?, ?)");
     const doc = db.prepare("INSERT INTO docs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const name = db.prepare("INSERT INTO names VALUES (?, ?)");
@@ -148,8 +183,10 @@ export function buildDatabase(file, sources) {
     );
     const basis = db.prepare("INSERT INTO basis VALUES (?, ?, ?, ?)");
     const link = db.prepare("INSERT INTO links VALUES (?, ?, ?, ?)");
+    const announcement = local && db.prepare("INSERT INTO local_docs VALUES (?, ?, ?, ?, ?, ?)");
+    const change = local && db.prepare("INSERT INTO changes VALUES (?, ?)");
     db.exec("BEGIN");
-    meta.run("schema", SCHEMA_VERSION);
+    meta.run("schema", local ? LOCAL_SCHEMA_VERSION : SCHEMA_VERSION);
     for (const source of sources) {
       meta.run("package:" + source.package, source.date);
       for (const xml of xmlFiles(source.dir)) {
@@ -162,26 +199,39 @@ export function buildDatabase(file, sources) {
             m.refid += "-" + variant;
             if (m.legacyID) m.legacyID += "-" + variant;
           }
-          const url = "https://lovdata.no/" + m.refid;
+          // An announcement in Lovtidend shares its refid with the consolidated regulation on
+          // lovdata.no. Its own address is the document ID ("LTII/forskrift/2026-04-30-710").
+          const url = local ? "https://lovdata.no/dokument/" + m.dokid : "https://lovdata.no/" + m.refid;
           doc.run(
-            m.refid, m.legacyID ?? null, PACKAGES[source.package], source.package,
+            m.refid, m.legacyID ?? null, source.type ?? PACKAGES[source.package], source.package,
             m.title, m.titleShort ?? null, m.lastChangeInForce ?? null, m.lastChangedBy ?? null,
             m.legalArea ?? null, m.eeaReferences ?? null,
           );
           for (const n of documentNames(m)) name.run(n, m.refid);
-          for (const href of new Set(m.basedOnRefs ?? [])) {
+          // Lovtidend lists the legal basis as plain text ("lov/2008-06-06-37/§16"), not as links.
+          const basedOn = local ? (m.basedOn ?? "").split("\n") : (m.basedOnRefs ?? []);
+          for (const href of new Set(basedOn)) {
             const target = href.match(BASIS_TARGET);
             if (target) basis.run(m.refid, target[1], target[2] ? paragraphKey(target[2]) : "", target[2] ?? "");
           }
           for (const p of parts) {
             const { lastInsertRowid } = part.run(
               m.refid, p.ord, p.kind, p.name, p.name ? paragraphKey(p.name) : INTRODUCTION, p.heading, p.text, p.notes,
-              p.name ? `${url}/${p.name}` : url, p.pending, p.pendingRefs.join(" "),
+              p.name && !local ? `${url}/${p.name}` : url, p.pending, p.pendingRefs.join(" "),
             );
             for (const href of p.links) {
               const target = href.match(LINK_TARGET);
               if (target) link.run(lastInsertRowid, target[1], paragraphKey(target[2]), target[3] ?? "");
             }
+          }
+          if (local) {
+            announcement.run(
+              m.refid, m.dateOfPublication ?? null, m.dateInForce ?? null, m.appliesTo ?? null, m.miscInformation ?? null,
+              placeWords(m.appliesTo || m.title),
+            );
+            // "forskrift/2002-03-22-314/§4" names a paragraph; what is kept is the document.
+            const targets = (m.changesToDocuments ?? "").split("\n").map((line) => line.match(BASIS_TARGET)?.[1]);
+            for (const target of new Set(targets.filter(Boolean))) change.run(m.refid, target);
           }
         } catch (err) {
           throw new Error(`Could not index ${path.basename(xml)}: ${err.message}`);
@@ -195,23 +245,61 @@ export function buildDatabase(file, sources) {
   }
 }
 
-/** Removes a directory this module created. Failing to clean up must never hide the real outcome. */
-function removeWorkDir(work) {
+/**
+ * Removes a directory this module created. Failing to clean up must never hide the real outcome.
+ * Not the synchronous call: the extracted local regulations are tens of thousands of files, and
+ * the server must keep answering while they are deleted.
+ */
+async function removeWorkDir(work) {
   try {
-    fs.rmSync(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await fs.promises.rm(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   } catch (err) {
     console.error(`[lovdata-mcp] could not remove ${work}: ${err.message}`);
   }
 }
 
 /** Build directories left behind by a process that was killed mid-build. */
-function removeAbandonedBuilds(dir) {
+async function removeAbandonedBuilds(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith("build-")) continue;
     const full = path.join(dir, entry.name);
-    if (Date.now() - fs.statSync(full).mtimeMs > ABANDONED_BUILD_MS) removeWorkDir(full);
+    // Gone already: another process got to it first.
+    const modified = fs.statSync(full, { throwIfNoEntry: false })?.mtimeMs;
+    if (modified !== undefined && Date.now() - modified > ABANDONED_BUILD_MS) await removeWorkDir(full);
   }
 }
+
+const localLock = (dir) => path.join(dir, "lokal.lock");
+
+/**
+ * Every open session runs its own server on the same data directory. One of them building the
+ * local regulations is enough; the others keep using the index that is there and pick up the
+ * new one when it is in place. Returns false when another process holds the lock.
+ */
+function takeLocalLock(dir) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.closeSync(fs.openSync(localLock(dir), "wx"));
+      return true;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const modified = fs.statSync(localLock(dir), { throwIfNoEntry: false })?.mtimeMs;
+      if (attempt === 2 || (modified !== undefined && Date.now() - modified < LOCAL_LOCK_STALE_MS)) return false;
+      fs.rmSync(localLock(dir), { force: true }); // left by a process that was killed, or gone in the meantime
+    }
+  }
+}
+
+/**
+ * The same build on another thread. Indexing every local regulation takes minutes, and the
+ * server must keep answering questions about current law meanwhile.
+ */
+const buildInWorker = (file, sources) =>
+  new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./build-worker.mjs", import.meta.url), { workerData: { file, sources } });
+    worker.once("error", reject);
+    worker.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`The index build stopped with code ${code}`))));
+  });
 
 /** On Windows the rename fails while another process has the old database open for a query. */
 async function replaceFile(from, to) {
@@ -227,55 +315,67 @@ async function replaceFile(from, to) {
 }
 
 /**
- * Downloads both packages and builds a new database that replaces the old one in a single
- * rename. Everything happens in a directory of this process's own, so several servers
+ * Downloads the source's packages and builds a new database that replaces the old one in a
+ * single rename. Everything happens in a directory of this process's own, so several servers
  * sharing the data directory cannot corrupt each other's work.
  */
-async function rebuild(dir, api, dates, state) {
-  removeAbandonedBuilds(dir);
+async function rebuild(dir, api, dates, state, source) {
+  const local = source === SOURCES[LOCAL];
+  await removeAbandonedBuilds(dir);
   const work = fs.mkdtempSync(path.join(dir, "build-"));
   try {
     const sources = [];
-    for (const name of Object.keys(PACKAGES)) {
+    for (const [i, name] of Object.keys(dates).entries()) {
       const res = await fetchOk(`${api}/get/${name}`, 180_000);
-      fs.writeFileSync(path.join(work, name), Buffer.from(await res.arrayBuffer()));
-      fs.mkdirSync(path.join(work, PACKAGES[name]));
+      await fs.promises.writeFile(path.join(work, name), Buffer.from(await res.arrayBuffer()));
+      const into = PACKAGES[name] ?? `${LOCAL}-${i}`;
+      fs.mkdirSync(path.join(work, into));
       // cwd and relative names: Git for Windows' tar reads "C:\..." as a remote host.
-      await run("tar", ["-xjf", name, "-C", PACKAGES[name]], { cwd: work });
-      sources.push({ dir: path.join(work, PACKAGES[name]), package: name, date: dates[name] });
+      await run("tar", ["-xjf", name, "-C", into], { cwd: work });
+      sources.push({ dir: path.join(work, into), package: name, date: dates[name], ...(local && { type: LOCAL }) });
     }
     // The date came from the list before the download. If Lovdata published in between,
     // the text would be newer than the date we label it with.
-    const after = await fetchPackageDates(api);
-    if (Object.keys(PACKAGES).some((name) => after[name] !== dates[name])) {
+    if (differs(await fetchPackageDates(api, source), dates)) {
       throw new Error("Lovdata published a new package during the download");
     }
-    const fresh = path.join(work, "lovdata.db");
-    buildDatabase(fresh, sources);
+    const fresh = path.join(work, source.db);
+    if (local) await buildInWorker(fresh, sources);
+    else buildDatabase(fresh, sources);
     // Lovdata only publishes the current text. What a paragraph said before is kept from the
     // day we start comparing. A change of schema means a change of parser, so the two indexes
     // cannot be compared then.
     // Losing one night of history is better than answering with yesterday's law.
-    if (state?.schema === SCHEMA_VERSION) {
+    if (!local && state?.schema === SCHEMA_VERSION) {
       try {
         recordChanges(dir, dbPath(dir), fresh, state, dates);
       } catch (err) {
         console.error(`[lovdata-mcp] could not record what changed since the last package: ${err.stack ?? err.message}`);
       }
     }
-    await replaceFile(fresh, dbPath(dir));
-    await notifyPinChanges(dir);
+    await replaceFile(fresh, dbPath(dir, source));
+    if (!local) await notifyPinChanges(dir);
   } finally {
-    removeWorkDir(work);
+    await removeWorkDir(work);
   }
 }
 
+/** Whether two sets of package dates name different packages or different dates. */
+const differs = (a, b) => {
+  const flat = (dates) => Object.keys(dates).sort().map((name) => `${name}=${dates[name]}`).join("\n");
+  return flat(a) !== flat(b);
+};
+
+/** The package dates an index was built from, out of its own record. */
+const indexedDates = (state) =>
+  Object.fromEntries(Object.entries(state).filter(([key]) => key.startsWith("package:")).map(([key, value]) => [key.slice(8), value]));
+
 /** The index's own record of what it contains, or null if there is no readable index. */
-function readState(dir) {
-  if (!fs.existsSync(dbPath(dir))) return null;
+function readState(dir, source) {
+  if (!fs.existsSync(dbPath(dir, source))) return null;
   let db;
   try {
-    db = new DatabaseSync(dbPath(dir), { readOnly: true });
+    db = new DatabaseSync(dbPath(dir, source), { readOnly: true });
     const rows = db.prepare("SELECT key, value FROM meta").all();
     return Object.fromEntries(rows.map((r) => [r.key, r.value]));
   } catch (err) {
@@ -286,9 +386,9 @@ function readState(dir) {
   }
 }
 
-function readCheckedAt(dir) {
+function readCheckedAt(dir, source) {
   try {
-    const { checkedAt } = JSON.parse(fs.readFileSync(checkedFile(dir), "utf8"));
+    const { checkedAt } = JSON.parse(fs.readFileSync(checkedFile(dir, source), "utf8"));
     return Number.isNaN(Date.parse(checkedAt)) ? null : checkedAt;
   } catch {
     return null; // missing or half-written: just check again
@@ -304,23 +404,29 @@ const lastFailure = new Map();
  * used, the problem is returned as `warning`, and the next attempt waits 15 minutes.
  * @returns {Promise<{ checkedAt: string | null, warning?: string }>}
  */
-export function ensureFresh(dir = dataDir(), options = {}) {
-  // One check at a time per directory in this process.
-  if (!inFlight.has(dir)) {
-    inFlight.set(dir, refresh(dir, options).finally(() => inFlight.delete(dir)));
+export const ensureFresh = (dir = dataDir(), options = {}) => ensureSourceFresh(dir, options, SOURCES.gjeldende);
+
+/** The same for the index of local regulations, which is fetched and checked on its own. */
+export const ensureLocalFresh = (dir = dataDir(), options = {}) => ensureSourceFresh(dir, options, SOURCES[LOCAL]);
+
+function ensureSourceFresh(dir, options, source) {
+  // One check at a time per directory and source in this process.
+  const key = dir + "\n" + source.db;
+  if (!inFlight.has(key)) {
+    inFlight.set(key, refresh(dir, options, source, key).finally(() => inFlight.delete(key)));
   }
-  return inFlight.get(dir);
+  return inFlight.get(key);
 }
 
-async function refresh(dir, { force = false, api = API } = {}) {
+async function refresh(dir, { force = false, api = defaultApi() } = {}, source, key) {
   fs.mkdirSync(dir, { recursive: true });
-  const state = readState(dir);
-  const usable = state?.schema === SCHEMA_VERSION;
-  const checkedAt = readCheckedAt(dir);
+  const state = readState(dir, source);
+  const usable = state?.schema === source.schema;
+  const checkedAt = readCheckedAt(dir, source);
   if (usable && !force) {
     const sinceCheck = checkedAt ? Date.now() - Date.parse(checkedAt) : Infinity;
     if (sinceCheck >= 0 && sinceCheck < CHECK_INTERVAL_MS) return { checkedAt };
-    const failure = lastFailure.get(dir);
+    const failure = lastFailure.get(key);
     if (failure && Date.now() - failure.at < RETRY_AFTER_FAILURE_MS) {
       return { checkedAt, warning: failure.warning };
     }
@@ -330,30 +436,65 @@ async function refresh(dir, { force = false, api = API } = {}) {
   try {
     let dates;
     try {
-      dates = await fetchPackageDates(api);
+      dates = await fetchPackageDates(api, source);
     } catch (err) {
       warning = `Fikk ikke kontakt med Lovdata for å sjekke om det finnes en nyere pakke (${err.message}). Teksten er fra den lokale kopien og kan være utdatert.`;
       throw err;
     }
-    if (!usable || Object.keys(PACKAGES).some((name) => state["package:" + name] !== dates[name])) {
+    if (!usable || differs(indexedDates(state), dates)) {
       warning = "Lovdata har lagt ut en nyere pakke, men den lot seg ikke hente og indeksere. Teksten er fra den forrige pakken og kan være utdatert.";
-      await rebuild(dir, api, dates, state);
+      if (source === SOURCES[LOCAL] && !takeLocalLock(dir)) {
+        // Not marked as checked: the next question looks again, and finds the other process's index.
+        return { checkedAt, warning: "En annen prosess henter og indekserer lokale forskrifter akkurat nå." + (usable ? " Svaret er fra den forrige pakken." : "") };
+      }
+      try {
+        await rebuild(dir, api, dates, state, source);
+      } finally {
+        if (source === SOURCES[LOCAL]) fs.rmSync(localLock(dir), { force: true });
+      }
     }
   } catch (err) {
-    if (!usable) throw new Error(`Could not fetch data from Lovdata, and there is no local copy: ${err.message}`);
+    if (!usable) {
+      // Remembered also without a copy to fall back on, so localIndexNow does not start a new download on every question.
+      lastFailure.set(key, { at: Date.now(), warning: `Fikk ikke hentet data fra Lovdata (${err.message}).` });
+      throw new Error(`Could not fetch data from Lovdata, and there is no local copy: ${err.message}`);
+    }
     console.error(`[lovdata-mcp] update failed, using local copy: ${err.message}`);
     warning += ` (${err.message})`;
-    lastFailure.set(dir, { at: Date.now(), warning });
+    lastFailure.set(key, { at: Date.now(), warning });
     return { checkedAt, warning };
   }
-  lastFailure.delete(dir);
+  lastFailure.delete(key);
   const now = new Date().toISOString();
   // Written under another name first: a reader must never see half a file.
-  const tmp = `${checkedFile(dir)}.${process.pid}.tmp`;
+  const tmp = `${checkedFile(dir, source)}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ checkedAt: now }));
-  await replaceFile(tmp, checkedFile(dir));
+  await replaceFile(tmp, checkedFile(dir, source));
   return { checkedAt: now };
 }
+
+/**
+ * The index of local regulations as it is right now. Never waits: a check against Lovdata is
+ * started in the background, and the answer is given from the index that is in place. A
+ * question about current law must not hang on a rebuild of the local regulations.
+ * @returns {{ usable: boolean, checkedAt: string | null, warning?: string }}
+ */
+export function localIndexNow(dir = dataDir(), options = {}) {
+  const source = SOURCES[LOCAL];
+  const key = dir + "\n" + source.db;
+  const failure = lastFailure.get(key);
+  if (!failure || Date.now() - failure.at >= RETRY_AFTER_FAILURE_MS) {
+    ensureLocalFresh(dir, options).catch((err) => console.error(`[lovdata-mcp] local regulations: ${err.message}`));
+  }
+  return {
+    usable: readState(dir, source)?.schema === source.schema,
+    checkedAt: readCheckedAt(dir, source),
+    warning: lastFailure.get(key)?.warning,
+  };
+}
+
+/** "Oslo kommune, Oslo." -> " oslo kommune oslo ": whole words, so «Os» does not find Oslo, nor «Hol» alkohol. */
+const placeWords = (s) => " " + s.toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, " ").trim() + " ";
 
 const ID_PATTERN = /^(lov|for|forskrift)[-/ ]?(\d{4}-\d{2}-\d{2}(?:-\d+)?(?:-[a-z]{2})?)$/i;
 export const MAX_CANDIDATES = 20;
@@ -366,10 +507,24 @@ export function refidFromId(query) {
 // Text standing directly in a document, outside every chapter and paragraph, is asked for by this name.
 export const INTRODUCTION = "innledning";
 
+/** Words must all occur; "quoted phrases" and trailing * (prefix) are supported. Null when nothing can match. */
+function ftsQuery(query) {
+  const terms = [];
+  for (const m of query.matchAll(/"([^"]+)"|(\S+)/g)) {
+    const raw = m[1] ?? m[2];
+    const prefix = m[2]?.endsWith("*") ? "*" : "";
+    // Only letters and digits can match anything; a term without them is dropped.
+    const cleaned = raw.replace(/["*]/g, "").trim();
+    if (/[\p{L}\p{N}]/u.test(cleaned)) terms.push(`"${cleaned}"${prefix}`);
+  }
+  return terms.length ? terms.join(" ") : null;
+}
+
 export class Store {
-  constructor(dir = dataDir()) {
+  /** @param {string} [source] LOCAL for the index of local regulations; current law otherwise */
+  constructor(dir = dataDir(), source = "gjeldende") {
     this.dir = dir;
-    this.db = new DatabaseSync(dbPath(dir), { readOnly: true });
+    this.db = new DatabaseSync(dbPath(dir, SOURCES[source]), { readOnly: true });
   }
 
   close() {
@@ -495,15 +650,8 @@ export class Store {
    * @returns {object[]} hits with document, heading, url and a snippet
    */
   search(query, { type, limit = 10 } = {}) {
-    const terms = [];
-    for (const m of query.matchAll(/"([^"]+)"|(\S+)/g)) {
-      const raw = m[1] ?? m[2];
-      const prefix = m[2]?.endsWith("*") ? "*" : "";
-      // Only letters and digits can match anything; a term without them is dropped.
-      const cleaned = raw.replace(/["*]/g, "").trim();
-      if (/[\p{L}\p{N}]/u.test(cleaned)) terms.push(`"${cleaned}"${prefix}`);
-    }
-    if (!terms.length) return [];
+    const match = ftsQuery(query);
+    if (!match) return [];
     return this.db
       .prepare(
         `SELECT d.refid, d.legacy_id, d.title, d.short_title, d.type, d.package,
@@ -515,6 +663,68 @@ export class Store {
          -- same relevance it goes before a regulation repeating it.
          ORDER BY bm25(fts, 4.0, 1.0) * CASE d.type WHEN 'lov' THEN 1.25 ELSE 1.0 END LIMIT ?`,
       )
-      .all(terms.join(" "), type ?? null, type ?? null, limit);
+      .all(match, type ?? null, type ?? null, limit);
+  }
+
+  // The rest is only for the index of local regulations.
+
+  /** A local regulation by ID or title. Titles recur from year to year, so the newest come first. */
+  resolveAnnounced(query) {
+    const refid = refidFromId(query);
+    if (refid) return { doc: this.document(refid), candidates: [] };
+    const name = normalizeName(query);
+    for (const condition of ["n.name = ?", "instr(n.name, ?) > 0"]) {
+      const found = this.db
+        .prepare(
+          `SELECT d.* FROM docs d JOIN local_docs l ON l.refid = d.refid
+           WHERE d.refid IN (SELECT n.refid FROM names n WHERE ${condition}) ORDER BY l.published DESC, d.refid DESC LIMIT ?`,
+        )
+        .all(name, MAX_CANDIDATES);
+      if (found.length === 1) return { doc: found[0], candidates: [] };
+      if (found.length) return { candidates: found };
+    }
+    return { candidates: [] };
+  }
+
+  /** Lovdata's fields on the announcement: when it was published, in force from, where it applies. */
+  announcement(refid) {
+    return this.db.prepare("SELECT * FROM local_docs WHERE refid = ?").get(refid);
+  }
+
+  /** What Lovdata has registered that this announcement changes or repeals. */
+  changesMadeBy(refid) {
+    return this.db
+      .prepare(
+        `SELECT c.target_refid, d.legacy_id, d.title FROM changes c LEFT JOIN docs d ON d.refid = c.target_refid
+         WHERE c.refid = ? ORDER BY c.rowid`,
+      )
+      .all(refid);
+  }
+
+  /** Later announcements Lovdata has registered as changing or repealing this one, oldest first. */
+  changedBy(refid) {
+    return this.db
+      .prepare(
+        `SELECT d.refid, d.legacy_id, d.title, l.published FROM changes c JOIN docs d ON d.refid = c.refid
+         JOIN local_docs l ON l.refid = d.refid WHERE c.target_refid = ? ORDER BY l.published, d.refid`,
+      )
+      .all(refid);
+  }
+
+  /** Full-text search in local regulations, optionally only those applying to a place (municipality, county). */
+  searchAnnounced(query, { place, limit = 10 } = {}) {
+    const match = ftsQuery(query);
+    if (!match) return [];
+    const where = place?.trim() ? placeWords(place) : null;
+    return this.db
+      .prepare(
+        `SELECT d.refid, d.legacy_id, d.title, d.short_title, d.package, p.kind, p.name, p.heading, p.url,
+                l.published, l.applies_to, (SELECT count(*) FROM changes c WHERE c.target_refid = d.refid) AS changed,
+                snippet(fts, 1, '', '', ' … ', 40) AS snippet
+         FROM fts JOIN parts p ON p.id = fts.rowid JOIN docs d ON d.refid = p.refid JOIN local_docs l ON l.refid = d.refid
+         WHERE fts MATCH ? AND (? IS NULL OR instr(l.place, ?) > 0)
+         ORDER BY bm25(fts, 4.0, 1.0) LIMIT ?`,
+      )
+      .all(match, where, where, limit);
   }
 }

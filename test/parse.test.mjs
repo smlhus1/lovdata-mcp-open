@@ -173,7 +173,15 @@ test("text outside the paragraphs is kept, one part per chapter", () => {
 
 test("real data: every character of text in the document body ends up in exactly one part", () => {
   // Guards against text being dropped or duplicated when the body is split into parts.
-  for (const file of ["lover/nl/nl-20030523-035.xml", "forskrifter/sf/sf-19840213-0427.xml", "forskrifter/del/sf-19610616-9392.xml"]) {
+  const files = [
+    "lover/nl/nl-20030523-035.xml",
+    "forskrifter/sf/sf-19840213-0427.xml",
+    "forskrifter/del/sf-19610616-9392.xml",
+    // Local regulations as announced in Norsk Lovtidend: a regulation, and one amending it.
+    "lokale/ltii/2026/lf-20260603-1082.xml",
+    "lokale/ltii/2026/lf-20260430-0710.xml",
+  ];
+  for (const file of files) {
     const html = fs.readFileSync(path.join(FIXTURES, file), "utf8");
     const { parts } = parseLovdataDocument(html);
     const body = html.slice(html.indexOf("<main"), html.indexOf("</main>"));
@@ -181,7 +189,7 @@ test("real data: every character of text in the document body ends up in exactly
     const expected = strip(
       body
         .replace(/<article class="changesToParent">.*?<\/article>/g, "")
-        .replace(/<h[1-6]>[^<]*<\/h[1-6]>/g, "") // chapter headings without text of their own
+        .replace(/<h[1-6][^>]*>[^<]*<\/h[1-6]>/g, "") // chapter headings without text of their own
         .replace(/<[^>]+>/g, "")
         .replace(/&amp;/g, "&"),
     );

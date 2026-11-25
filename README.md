@@ -8,12 +8,44 @@ Lovdatas åpne data (`api.lovdata.no`), uten tredjepart imellom.
 | Verktøy | Gir deg |
 |---|---|
 | `hent_paragraf` | En paragraf ordrett, med dokumentets navn, ID, lenke til lovdata.no og datoen teksten er fra. Uten paragraf: listen over paragrafer i dokumentet. |
-| `sok` | Fritekstsøk på tvers av lover og forskrifter. Alle ordene må stå i samme paragraf. `"frase"` og `oppsig*` virker. |
+| `sok` | Fritekstsøk på tvers av lover og forskrifter. Alle ordene må stå i samme paragraf. `"frase"` og `oppsig*` virker. Med `type: "lokal"` eller `sted`: søk i lokale forskrifter, avgrenset til en kommune eller et fylke. |
 | `henvisninger` | Hvilke andre bestemmelser som viser til en paragraf, slik Lovdata har lenket dem: unntak, straffebestemmelser, forskrifter som bygger på den. |
 | `historikk` | Hva en paragraf sa før den ble endret, ordrett. Går bare tilbake til da installasjonen begynte å ta vare på teksten. |
 | `kommende_endringer` | Alt som er vedtatt, men ikke i kraft: én oppføring per endringslov, med tidspunktet ordrett fra Lovdatas note, rettsområde, EU/EØS-henvisning og hvilke dokumenter som berøres. |
 
 Hvert svar oppgir Lovdata som kilde, lisensen (NLOD 2.0) og tekstdatoen.
+
+## Lokale forskrifter
+
+Lokale forskrifter (kommuner, fylker, verneområder, jakt, fiske, politivedtekter) er med, men som en egen kilde med et
+annet løfte. Lovdata gir dem ikke ut ajourført. Det som finnes åpent, er Norsk Lovtidend avdeling II: hver forskrift og
+hver endringsforskrift slik den ble kunngjort, fra 2001.
+
+- **Teksten er den kunngjorte, ikke den gjeldende.** En forskrift fra 2015 står som i 2015, selv om den er endret
+  siden. Endringene ligger som egne kunngjøringer. Serveren fletter dem ikke inn.
+- **Hvert svar sier fra.** Det begynner med «KUNNGJORT TEKST, IKKE AJOURFØRT» og kunngjøringsdatoen.
+- **Senere kunngjøringer listes.** Lovdata registrerer hvilke dokumenter en kunngjøring endrer. Svaret viser de senere
+  kunngjøringene som peker på forskriften du hentet. Feltet skiller ikke mellom endring og oppheving, så les den
+  nyeste. En tom liste viser ikke at forskriften gjelder uendret: endringer før 2001 og endringer Lovdata ikke har
+  registrert, er ikke med.
+- **Ikke med i vanlig søk.** `sok` uten type søker bare i gjeldende lover og sentrale forskrifter, som før.
+  `hent_paragraf` finner en lokal forskrift på ID (`FOR-2022-06-16-1148`) eller tittel når navnet ikke passer på noe
+  gjeldende.
+- **Ikke med i de andre verktøyene.** `henvisninger`, `historikk`, `kommende_endringer` og festede paragrafer
+  gjelder bare gjeldende lover og sentrale forskrifter.
+
+```text
+sok            tekst: "skjenketid*"  type: "lokal"  sted: "Oslo"
+hent_paragraf  dokument: "FOR-2006-05-03-490"  paragraf: "§ 2"
+```
+
+`sted` sammenlignes med Lovdatas felt «Gjelder for», som hele ord: «Os» finner Os, ikke Oslo. Hvert treff viser
+feltet selv.
+
+Lokale forskrifter ligger i en egen indeks (`lokal.db`) som hentes og sjekkes for seg, på en egen tråd. Ingen
+spørsmål venter på den: svaret kommer fra indeksen som ligger der, og en ny hentes i bakgrunnen (halvannet til to
+minutter). Finnes det ingen indeks ennå, sier svaret det. Har du flere økter åpne, bygger bare én av dem.
+
 
 ## Følge med på paragrafene du bygger på
 
@@ -62,11 +94,12 @@ Krever Node 22.13 eller nyere og `tar` med bzip2 (følger med macOS og Windows 1
 ```bash
 git clone https://github.com/smlhus1/lovdata-mcp-open.git lovdata-mcp && cd lovdata-mcp
 npm ci
-npm run update   # laster ned og indekserer, ett til to minutter
+npm run update   # laster ned og indekserer, tre til fire minutter første gang
 claude mcp add --scope user lovdata -- node "$(pwd)/src/server.mjs"
 ```
 
-Dataene legges i `~/.lovdata-mcp` (ca. 200 MB). Sett `LOVDATA_MCP_DATA` for å bruke en annen mappe.
+Dataene legges i `~/.lovdata-mcp` (ca. 450 MB, hvorav 250 MB er lokale forskrifter). Under oppdatering trengs
+ca. 600 MB til i samme mappe. Sett `LOVDATA_MCP_DATA` for å bruke en annen mappe.
 
 ## Hvor fersk teksten er
 
@@ -106,8 +139,9 @@ forkortes, med beskjed om det og lenke til resten.
 
 ## Hva som er med
 
-De to pakkene `gjeldende-lover` og `gjeldende-sentrale-forskrifter`. Ikke med: lokale forskrifter, Lovtidend,
-opphevede lover, forarbeider og rettsavgjørelser.
+De to pakkene `gjeldende-lover` og `gjeldende-sentrale-forskrifter`, og `lovtidend-avd2-*` (lokale forskrifter
+slik de ble kunngjort, se over). Ikke med: Lovtidend avdeling I, lokale forskrifter fra før 2001, opphevede lover,
+forarbeider og rettsavgjørelser.
 
 ## Tester
 

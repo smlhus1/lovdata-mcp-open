@@ -10,7 +10,9 @@ export const FIXTURES = fileURLToPath(new URL("./fixtures/", import.meta.url));
 export const PUBLISHED = fileURLToPath(new URL("./published/", import.meta.url));
 export const PACKAGE_DATE = "2026-11-21T02:32:00Z";
 
-// The tests must never read the real pins or write to the real agent channel.
+// The tests must never reach Lovdata, read the real pins or write to the real agent channel.
+// Port 9 (discard) refuses the connection; tests that download pass their own server as `api`.
+process.env.LOVDATA_MCP_API = "http://127.0.0.1:9";
 process.env.LOVDATA_MCP_PINS = path.join(os.tmpdir(), "lovdata-mcp-test-no-pins.json");
 delete process.env.LOVDATA_MCP_MELD;
 
@@ -26,7 +28,9 @@ export function buildDataDir({ lover = path.join(FIXTURES, "lover"), forskrifter
     { dir: lover, package: "gjeldende-lover.tar.bz2", date: PACKAGE_DATE },
     { dir: forskrifter, package: "gjeldende-sentrale-forskrifter.tar.bz2", date: PACKAGE_DATE },
   ]);
-  fs.writeFileSync(path.join(dir, "checked.json"), JSON.stringify({ checkedAt: new Date().toISOString() }));
+  buildDatabase(path.join(dir, "lokal.db"), [{ dir: path.join(FIXTURES, "lokale"), package: LOKALE_I_AAR, date: PACKAGE_DATE, type: "lokal" }]);
+  const checked = JSON.stringify({ checkedAt: new Date().toISOString() });
+  for (const file of ["checked.json", "checked-lokal.json"]) fs.writeFileSync(path.join(dir, file), checked);
   return dir;
 }
 
@@ -44,6 +48,7 @@ export function corruptedLover() {
 
 export const LOVER = "gjeldende-lover.tar.bz2";
 export const FORSKRIFTER = "gjeldende-sentrale-forskrifter.tar.bz2";
+export const LOKALE_I_AAR = "lovtidend-avd2-2026.tar.bz2";
 
 /** A directory of documents as the .tar.bz2 Lovdata would serve. */
 export function pack(sourceDir) {

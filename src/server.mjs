@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // MCP server (stdio): verbatim lookup and full-text search in current Norwegian
-// laws and central regulations, straight from Lovdata's open data.
+// laws and central regulations, and in local regulations as announced, straight from
+// Lovdata's open data.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { hentParagraf, sok, henvisninger, historikk, kommende } from "./answers.mjs";
-import { ensureFresh } from "./store.mjs";
+import { ensureFresh, ensureLocalFresh } from "./store.mjs";
 
 const server = new McpServer({ name: "lovdata", version: "0.1.0" });
 
@@ -26,6 +27,8 @@ server.registerTool(
       "Henter en paragraf ordrett fra en gjeldende norsk lov eller sentral forskrift, med dokumentets navn, ID, " +
       "lenke til lovdata.no og datoen teksten er fra. Sier også fra om vedtatte endringer som ikke er i kraft, " +
       "og hvilke forskrifter som har hjemmel i paragrafen. Uten paragraf: viser hvilke paragrafer dokumentet har. " +
+      "Finner også lokale forskrifter (kommuner og fylker) på ID eller tittel. De gjengis slik de ble kunngjort i " +
+      "Norsk Lovtidend fra 2001, ikke ajourført, og svaret lister senere kunngjøringer som endrer eller opphever dem. " +
       "Bruk dette før du siterer lovtekst. Data hentes direkte fra Lovdata (NLOD 2.0).",
     inputSchema: {
       dokument: z
@@ -47,10 +50,20 @@ server.registerTool(
     description:
       "Fritekstsøk på tvers av gjeldende norske lover og sentrale forskrifter. Alle ordene må finnes i samme paragraf. " +
       "«Anførselstegn» gir eksakt frase, og * til slutt i et ord gir trunkering (oppsig*). " +
-      "Svarer med paragraf, lenke og et kort utdrag. Data hentes direkte fra Lovdata (NLOD 2.0).",
+      "Svarer med paragraf, lenke og et kort utdrag. Lokale forskrifter er ikke med uten type «lokal». Da søkes det " +
+      "i forskriftene slik de ble kunngjort i Norsk Lovtidend fra 2001, ikke ajourført: treffene kan være endret " +
+      "eller opphevet senere. Data hentes direkte fra Lovdata (NLOD 2.0).",
     inputSchema: {
       tekst: z.string().min(2).max(300).describe("Søkeord eller frase."),
-      type: z.enum(["lov", "forskrift"]).optional().describe("Begrens søket til lover eller forskrifter."),
+      type: z
+        .enum(["lov", "forskrift", "lokal"])
+        .optional()
+        .describe("Begrens søket til lover eller sentrale forskrifter. «lokal» søker i lokale forskrifter slik de ble kunngjort."),
+      sted: z
+        .string()
+        .max(100)
+        .optional()
+        .describe("Kommune eller fylke en lokal forskrift gjelder for, som hele ord. Gir søk i lokale forskrifter. Eksempler: «Bergen», «Finnmark»."),
       antall: z.number().int().min(1).max(50).default(10).describe("Antall treff."),
     },
     annotations: { readOnlyHint: true },
@@ -119,5 +132,7 @@ server.registerTool(
 
 // Start the update check now, so the first question does not have to wait for a nightly rebuild.
 ensureFresh().catch((err) => console.error(`[lovdata-mcp] ${err.message}`));
+// The local regulations are a separate index. A lookup in current law never waits for it.
+ensureLocalFresh().catch((err) => console.error(`[lovdata-mcp] local regulations: ${err.message}`));
 
 await server.connect(new StdioServerTransport());
